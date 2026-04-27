@@ -1,7 +1,9 @@
 import argparse
 import json
 import re
+import subprocess
 import sys
+import time
 from collections import deque
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -291,6 +293,20 @@ def normalize_output_dir(output_dir):
     return Path(output_dir).expanduser().resolve(strict=False)
 
 
+_MULLVAD_RECONNECT_WAIT = 5
+
+
+def mullvad_reconnect():
+    """Switch the active Mullvad VPN server to obtain a fresh exit IP."""
+    subprocess.run(
+        ["mullvad", "reconnect"],
+        check=True,
+        capture_output=True,
+        timeout=15,
+    )
+    time.sleep(_MULLVAD_RECONNECT_WAIT)
+
+
 def is_ip_block_error(exc):
     error_name = exc.__class__.__name__
     if error_name in {"RequestBlocked", "IpBlocked"}:
@@ -318,7 +334,9 @@ def write_transcript_file(video_id, transcript, output_dir):
     return str(file_path)
 
 
-def download_transcripts(url, output_dir="transcripts", languages=None, session=None):
+def download_transcripts(
+    url, output_dir="transcripts", languages=None, session=None, mullvad_retries=3
+):
     output_dir = normalize_output_dir(output_dir)
 
     try:
@@ -333,11 +351,15 @@ def download_transcripts(url, output_dir="transcripts", languages=None, session=
     skipped_files = []
     failed_videos = []
     aborted_videos = []
+    reconnect_attempts = 0
 
-    for index, video_id in enumerate(video_ids):
+    index = 0
+    while index < len(video_ids):
+        video_id = video_ids[index]
         file_path = transcript_file_path(video_id, output_dir)
         if file_path.exists():
             skipped_files.append(str(file_path))
+            index += 1
             continue
 
         try:
@@ -345,11 +367,23 @@ def download_transcripts(url, output_dir="transcripts", languages=None, session=
             written_files.append(
                 write_transcript_file(video_id, transcript, output_dir=output_dir)
             )
+            index += 1
         except Exception as exc:
-            failed_videos.append({"video_id": video_id, "error": str(exc)})
-            if is_ip_block_error(exc):
-                aborted_videos = video_ids[index + 1 :]
-                break
+            if is_ip_block_error(exc) and reconnect_attempts < mullvad_retries:
+                reconnect_attempts += 1
+                try:
+                    mullvad_reconnect()
+                except Exception:
+                    failed_videos.append({"video_id": video_id, "error": str(exc)})
+                    aborted_videos = list(video_ids[index + 1 :])
+                    break
+                # retry same video without advancing index
+            else:
+                failed_videos.append({"video_id": video_id, "error": str(exc)})
+                if is_ip_block_error(exc):
+                    aborted_videos = list(video_ids[index + 1 :])
+                    break
+                index += 1
 
     return {
         "processed_videos": video_ids,
@@ -379,12 +413,20 @@ def main(argv=None):
         dest="languages",
         help="Preferred transcript language. Repeat to provide fallbacks.",
     )
+    parser.add_argument(
+        "--mullvad-retries",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Times to reconnect via Mullvad VPN when YouTube blocks the IP (default: 3).",
+    )
     args = parser.parse_args(argv)
 
     result = download_transcripts(
         args.url,
         output_dir=args.output_dir,
         languages=args.languages,
+        mullvad_retries=args.mullvad_retries,
     )
 
     summary = (
