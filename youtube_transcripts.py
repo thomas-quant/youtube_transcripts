@@ -227,11 +227,19 @@ def _fetch_playlist_continuation(session, playlist_url, context, continuation_to
     return response.json()
 
 
+def _make_session():
+    """Return a requests.Session with cookies that bypass the YouTube consent gate."""
+    s = requests.Session()
+    s.cookies.set("CONSENT", "YES+1", domain=".youtube.com")
+    s.cookies.set("SOCS", "CAE=", domain=".youtube.com")
+    return s
+
+
 def get_playlist_video_ids(playlist_url, session=None):
     parsed_url = urlparse(playlist_url)
     _validate_youtube_host(parsed_url)
 
-    session = session or requests
+    session = session or _make_session()
     response = session.get(playlist_url, timeout=30)
     response.raise_for_status()
 
@@ -294,17 +302,36 @@ def normalize_output_dir(output_dir):
 
 
 _MULLVAD_RECONNECT_WAIT = 5
+_MULLVAD_CANDIDATES = ["mullvad", "mullvad.exe"]
 
 
 def mullvad_reconnect():
-    """Switch the active Mullvad VPN server to obtain a fresh exit IP."""
-    subprocess.run(
-        ["mullvad", "reconnect"],
-        check=True,
-        capture_output=True,
-        timeout=15,
-    )
-    time.sleep(_MULLVAD_RECONNECT_WAIT)
+    """Switch the active Mullvad VPN server to obtain a fresh exit IP.
+
+    Tries 'mullvad' then 'mullvad.exe' to support both native Linux and WSL.
+    """
+    last_exc = None
+    for cmd in _MULLVAD_CANDIDATES:
+        try:
+            subprocess.run(
+                [cmd, "reconnect"],
+                check=True,
+                capture_output=True,
+                timeout=15,
+            )
+            time.sleep(_MULLVAD_RECONNECT_WAIT)
+            return
+        except FileNotFoundError:
+            last_exc = RuntimeError(
+                f"Mullvad CLI not found (tried: {', '.join(_MULLVAD_CANDIDATES)})"
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f"mullvad reconnect failed (exit {exc.returncode}): "
+                f"{exc.stderr.decode(errors='replace').strip()}"
+            ) from exc
+
+    raise last_exc
 
 
 def is_ip_block_error(exc):
@@ -341,11 +368,12 @@ def download_transcripts(
 
     try:
         extract_playlist_id(url)
+    except ValueError:
+        video_ids = [extract_video_id(url)]
+    else:
         video_ids = get_playlist_video_ids(url, session=session)
         if not video_ids:
             raise ValueError("No videos found in playlist")
-    except ValueError:
-        video_ids = [extract_video_id(url)]
 
     written_files = []
     skipped_files = []
@@ -371,9 +399,15 @@ def download_transcripts(
         except Exception as exc:
             if is_ip_block_error(exc) and reconnect_attempts < mullvad_retries:
                 reconnect_attempts += 1
+                print(
+                    f"IP blocked on {video_id}. Reconnecting via Mullvad "
+                    f"(attempt {reconnect_attempts}/{mullvad_retries})...",
+                    file=sys.stderr,
+                )
                 try:
                     mullvad_reconnect()
-                except Exception:
+                except Exception as reconnect_exc:
+                    print(f"Mullvad reconnect failed: {reconnect_exc}", file=sys.stderr)
                     failed_videos.append({"video_id": video_id, "error": str(exc)})
                     aborted_videos = list(video_ids[index + 1 :])
                     break
@@ -422,12 +456,16 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    result = download_transcripts(
-        args.url,
-        output_dir=args.output_dir,
-        languages=args.languages,
-        mullvad_retries=args.mullvad_retries,
-    )
+    try:
+        result = download_transcripts(
+            args.url,
+            output_dir=args.output_dir,
+            languages=args.languages,
+            mullvad_retries=args.mullvad_retries,
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
     summary = (
         f"Processed {len(result['processed_videos'])} videos. "
